@@ -1,0 +1,2 @@
+*.png filter=lfs diff=lfs merge=lfs -text
+server/static/downloaded_image/*.png filter=lfs diff=lfs merge=lfs -text

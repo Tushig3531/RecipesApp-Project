@@ -1,6 +1,6 @@
 async function checkAuth() {
     try {
-        const response = await fetch("http://localhost:5001/protected", {
+        const response = await fetch("http://localhost:8080/protected", {
             method: 'GET',
             credentials: 'include' // Send cookies
         });
@@ -18,7 +18,7 @@ async function checkAuth() {
 
 async function logout() {
     try {
-        const response = await fetch("http://localhost:5001/logout", {
+        const response = await fetch("http://localhost:8080/logout", {
             method: 'POST',
             credentials: 'include'
         });

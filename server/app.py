@@ -98,12 +98,6 @@ def protected():
         return jsonify({'message': f'Token validation failed: {str(e)}'}), 422
 
 
-def get_image_url(image_name):
-    if not image_name:
-        return ""
-    if not image_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-        image_name += '.png'  
-    return url_for('static', filename=f'downloaded_images/{image_name}', _external=True)
 
 def load_recipes_from_csv():
     recipes = []
@@ -133,6 +127,13 @@ def load_recipes_from_csv():
         logging.error("Food.csv does not exist.")
     logging.info(f"Loaded {len(recipes)} recipes from CSV.")
     return recipes
+
+def get_image_url(image_name):
+    if not image_name:
+        return ""
+    return f"hhttps://storage.googleapis.com/recipesapp-images1/{image_name}"
+
+
 
 def search_recipes_from_csv_by_ingredients(ingredient_string):
     ingredient_list = [ing.strip().lower() for ing in ingredient_string.split(",") if ing.strip()]
@@ -549,4 +550,4 @@ def youtube_tutorial():
         return jsonify({"youtube_url": ""}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=8080)

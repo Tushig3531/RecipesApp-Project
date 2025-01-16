@@ -1,4 +1,4 @@
-const api_uri = 'http://localhost:5001';
+const api_uri = 'http://localhost:8080';
 
 function getCookie(name) {
   const cookie = document.cookie

@@ -1,4 +1,4 @@
-const api_uri = 'http://localhost:5001';  
+const api_uri = 'http://localhost:8080';  
 const YOUTUBE_API_KEY = "AIzaSyAmHHz3lgsGTPO7AyxQ-BMCf5g174J5r8w";  
 
 

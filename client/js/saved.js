@@ -1,4 +1,4 @@
-const api_uri = 'http://localhost:5001';
+const api_uri = 'http://localhost:8080';
 
 function closeModal() {
     $('#recipe-modal').modal('hide');

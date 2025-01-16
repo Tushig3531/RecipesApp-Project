@@ -131,7 +131,7 @@ def load_recipes_from_csv():
 def get_image_url(image_name):
     if not image_name:
         return ""
-    return f"hhttps://storage.googleapis.com/recipesapp-images1/{image_name}"
+    return f"https://storage.googleapis.com/recipesapp-images1/{image_name}.png"
 
 
 

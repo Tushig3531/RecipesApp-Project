@@ -61,54 +61,57 @@ async function fetchYouTubeTutorial(queryStr) {
 }
 
 function displaySavedRecipes(recipes) {
-    const recipeList = document.getElementById("saved-recipes");
-    recipeList.innerHTML = "";
+    const savedRecipesList = document.getElementById("saved-recipes");
+    savedRecipesList.innerHTML = "";
 
-    if (recipes.length === 0) {
-        recipeList.innerHTML = "<p class='text-center w-100'>You have no saved recipes.</p>";
+    if (!recipes.length) {
+        savedRecipesList.innerHTML = "<p class='text-center w-100'>No saved recipes.</p>"; 
         return;
     }
 
-    recipes.forEach(recipe => {
+    recipes.forEach(r => {
         const column = document.createElement("div");
-        column.classList.add("col-md-3", "col-sm-6", "mb-4");
+        column.classList.add("col-md-3", "col-sm-6", "mb-4"); 
 
         const card = document.createElement("div");
-        card.classList.add("card", "h-100", "recipe-card");
-        card.style.cursor = "pointer";
-        card.addEventListener("click", () => openRecipeModal(recipe.name));
+        card.classList.add("card", "h-100", "recipe-card"); 
+        card.style.cursor = "pointer"; 
+        card.addEventListener("click", () => openRecipeModal(r.name));
 
+        // Card image
         const img = document.createElement("img");
-        img.classList.add("card-img-top", "recipe-image");
-        img.src = recipe.image_url || "https://via.placeholder.com/250x180?text=No+Image";
-        img.alt = recipe.name;
+        img.classList.add("card-img-top", "recipe-image"); 
+        img.src = r.image_url || "https://via.placeholder.com/250x180?text=No+Image";
+        img.alt = r.name;
         img.onerror = () => {
             img.src = "https://via.placeholder.com/250x180?text=No+Image";
         };
         card.appendChild(img);
 
+        // Card body
         const cardBody = document.createElement("div");
-        cardBody.classList.add("card-body", "p-2");
+        cardBody.classList.add("card-body", "p-2"); 
 
         const title = document.createElement("h5");
-        title.classList.add("card-title", "text-truncate");
-        title.textContent = recipe.name;
+        title.classList.add("card-title", "text-truncate"); 
+        title.textContent = r.name;
 
         cardBody.appendChild(title);
 
+        
         const removeButton = document.createElement("button");
-        removeButton.classList.add("btn", "btn-danger", "btn-sm", "mt-2");
+        removeButton.classList.add("btn", "btn-danger", "btn-sm", "mt-2"); 
         removeButton.textContent = "Remove";
-        removeButton.addEventListener("click", (e) => {
-            e.stopPropagation();
-            confirmAndRemoveRecipe(recipe.recipe_id);
+        removeButton.addEventListener("click", (event) => {
+            event.stopPropagation(); 
+            confirmAndRemoveRecipe(r.recipe_id);
         });
 
         cardBody.appendChild(removeButton);
         card.appendChild(cardBody);
 
         column.appendChild(card);
-        recipeList.appendChild(column);
+        savedRecipesList.appendChild(column);
     });
 }
 

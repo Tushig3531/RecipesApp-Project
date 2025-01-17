@@ -28,7 +28,7 @@ jobs:
 
       # Step 4: Set up Google Cloud SDK
       - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v4  # Use 'v4' to get the latest v4.x.x version
+        uses: google-github-actions/setup-gcloud@v4.14.0  # Use the exact latest version
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}

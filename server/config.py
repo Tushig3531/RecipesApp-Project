@@ -25,13 +25,12 @@ def create_app():
     password_raw = os.getenv("CLOUD_SQL_PASSWORD", "")
     password_encoded = urllib.parse.quote_plus(password_raw)
     # Read env variables:
-    db_user = os.getenv("CLOUD_SQL_USERNAME", "admin")
-    db_host = os.getenv("DB_HOST", "127.0.0.1")
-    db_name = os.getenv("CLOUD_SQL_DATABASE", "recipesdb")
+    db_user = os.getenv("CLOUD_SQL_USERNAME")
+    db_host = os.getenv("DB_HOST")
+    db_name = os.getenv("CLOUD_SQL_DATABASE")
+    db_password=os.getenv("CLOUD_SQL_PASSWORD")
 
-    uri = f"postgresql+psycopg2://{db_user}:{password_encoded}@{db_host}:5432/{db_name}"
-    this_app.config["SQLALCHEMY_DATABASE_URI"] = uri
-
+    this_app.config["SQLALCHEMY_DATABASE_URI"] = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:5432/{db_name}"
     this_app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "default_secret")
     this_app.config["JWT_SECRET_KEY"] = os.getenv("FLASK_JWT_SECRET_KEY", "default_jwt_secret")
     this_app.config["SQLALCHEMY_ECHO"] = os.getenv("FLASK_SQLALCHEMY_ECHO", False)

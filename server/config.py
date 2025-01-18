@@ -17,24 +17,25 @@ def create_app():
     this_app = Flask(__name__)
     this_dir = pathlib.Path(__file__)
 
-    # Load .flaskenv from the same directory or parent directory
     dotenv.load_dotenv(this_dir.parent / ".flaskenv")
 
     this_app.config.from_prefixed_env()
 
-    password_raw = os.getenv("CLOUD_SQL_PASSWORD", "")
-    password_encoded = urllib.parse.quote_plus(password_raw)
-    # Read env variables:
-    db_user = os.getenv("CLOUD_SQL_USERNAME")
-    db_host = os.getenv("DB_HOST")
-    db_name = os.getenv("CLOUD_SQL_DATABASE")
-    db_password=os.getenv("CLOUD_SQL_PASSWORD")
 
-    this_app.config["SQLALCHEMY_DATABASE_URI"] = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:5432/{db_name}"
+    db_user = os.getenv("CLOUD_SQL_USERNAME")
+    db_password = os.getenv("CLOUD_SQL_PASSWORD")
+    db_name = os.getenv("CLOUD_SQL_DATABASE")
+    connection_name = os.getenv("CLOUD_SQL_CONNECTION_NAME")
+
+    db_uri = (
+        f"postgresql+psycopg2://{db_user}:{db_password}@/"
+        f"{db_name}?host=/cloudsql/{connection_name}"
+    )
+    this_app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
     this_app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "default_secret")
     this_app.config["JWT_SECRET_KEY"] = os.getenv("FLASK_JWT_SECRET_KEY", "default_jwt_secret")
-    this_app.config["SQLALCHEMY_ECHO"] = os.getenv("FLASK_SQLALCHEMY_ECHO", False)
-    this_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = os.getenv("FLASK_SQLALCHEMY_TRACK_MODIFICATIONS", False)
+    this_app.config["SQLALCHEMY_ECHO"] = bool(int(os.getenv("FLASK_SQLALCHEMY_ECHO", 0)))
+    this_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = bool(int(os.getenv("FLASK_SQLALCHEMY_TRACK_MODIFICATIONS", 0)))
 
     CORS(
         this_app,
@@ -53,7 +54,6 @@ def create_app():
 
     migrate = Migrate(this_app, db)
 
-    # Create tables if they don’t exist
     with this_app.app_context():
         db.create_all()
 

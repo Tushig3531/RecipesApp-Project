@@ -20,4 +20,4 @@ Reduce Food Waste: Use up what you have in your fridge before it goes bad.
 Easy to Use: Simple and intuitive interface makes meal planning for free.
 
 
-Example: If you have chicken, tomatoes, and rice in your fridge, just add these items to FridgeChef, and it might suggest a delicious chicken and tomato rice dish for you to try!
+Example: If you have chicken, tomatoes, and rice in your fridge, just add these items to RecipesApp, and it might suggest a delicious chicken and tomato rice dish for you to try!

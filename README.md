@@ -6,7 +6,7 @@ https://recipesapps.com/
 Create your personal fridge by adding the items you have, like vegetables, meats, spices, and more.
 
   **Search for Recipes:**
-Enter the ingredients you want to use, and FridgeChef will show you recipes that match what you have.
+Enter the ingredients you want to use, and RecipesApp will show you recipes that match what you have.
 
   **Get Recipe Details:**
 Each recipe includes all the information you need, such as cooking instructions, ingredients list, and preparation time.

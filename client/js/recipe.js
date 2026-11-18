@@ -1,601 +1,220 @@
+import { api, debounce, el, prefs, suggestionKeys, toast } from "./api.js";
+import { emptyState, openRecipeModal, renderRecipes, showSkeleton } from "./recipes-ui.js";
 
-const YOUTUBE_API_KEY = "AIzaSyAmHHz3lgsGTPO7AyxQ-BMCf5g174J5r8w";  
+const PER_PAGE = 24;
+const PLACEHOLDERS = { ingredients: "chicken, garlic, lemon", name: "mac and cheese" };
+const byId = (id) => document.getElementById(id);
+const state = { mode: "fridge", query: "", page: 1 };
+let requestSeq = 0;
+let suggestSeq = 0;
 
+restorePrefs();
+bindEvents();
+applyMode();
 
-let currentPage = 1;
-let lastSearchQuery = "";
-let searchType = "ingredients"; 
-
-
-async function fetchYouTubeTutorial(queryStr) {
-    if (!YOUTUBE_API_KEY) return "";
-
-    const query = encodeURIComponent(`${queryStr} tutorial`);
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=${query}&key=${YOUTUBE_API_KEY}`;
-
-    try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error("YouTube API request failed.");
-        const data = await response.json();
-        if (data.items && data.items.length > 0) {
-            const videoId = data.items[0].id.videoId;
-            return `https://www.youtube.com/embed/${videoId}`;
-        }
-        return "";
-    } catch (error) {
-        console.error("YouTube fetch error:", error);
-        return "";
-    }
+function currentMode() {
+  return document.querySelector('input[name="mode"]:checked')?.value || "fridge";
 }
 
-
-function capitalizeWords(str) {
-    if (!str) return '';
-    return str.replace(/\b\w/g, char => char.toUpperCase());
+function selectedDiets() {
+  return [...document.querySelectorAll('input[name="diet"]:checked')].map((b) => b.value);
 }
 
-
-function escapeHtml(text) {
-  if (!text) return '';
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+function filterParams() {
+  const params = new URLSearchParams({ kind: byId("include-drinks").checked ? "all" : "food" });
+  const diets = selectedDiets();
+  if (diets.length) params.set("diet", diets.join(","));
+  return params;
 }
 
-
-function escapeAttribute(text) {
-  if (!text) return '';
-  return text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-}
-
-
-async function loadFridgeItems(elementId) {
-    try {
-        const response = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/fridge`, { 
-            method: 'GET',
-            credentials: 'include'
-        });
-        if (!response.ok) throw new Error('Failed to fetch fridge items.');
-        const data = await response.json();
-
-        const fridgeList = document.getElementById(elementId);
-        if (fridgeList) {
-            fridgeList.innerHTML = ''; 
-            if (data.length === 0) {
-                fridgeList.innerHTML = '<li class="list-group-item">Your fridge is empty.</li>';
-            } else {
-                data.forEach(item => {
-                    fridgeList.innerHTML += `
-                        <li class="list-group-item d-flex justify-content-between align-items-center">
-                            <span>
-                                <strong>${escapeHtml(item.item_name)}</strong> - Brand: ${escapeHtml(item.brand)} - Quantity: ${escapeHtml(item.quantity)}
-                            </span>
-                        </li>
-                    `;
-                });
-            }
-        } else {
-            console.error(`Element with ID '${elementId}' not found.`);
-        }
-    } catch (error) {
-        console.error("Error fetching fridge items:", error);
-        const fridgeList = document.getElementById(elementId);
-        if (fridgeList) {
-            fridgeList.innerHTML = '<li class="list-group-item text-danger">Failed to load fridge items.</li>';
-        }
-    }
-}
-
-function openEditModal(itemId, currentQuantity) {
-    alert(`Edit functionality for item ID ${itemId} is not implemented yet.`);
-}
-
-async function deleteItem(itemId) {
-    if (!confirm("Are you sure you want to delete this item from your fridge?")) return;
-
-    try {
-        const response = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/fridge/${itemId}`, {
-            method: 'DELETE',
-            credentials: 'include'
-        });
-        const data = await response.json();
-        if (!response.ok) {
-            throw new Error(data.error || "Failed to delete fridge item.");
-        }
-        alert(data.message || "Fridge item deleted successfully!");
-        
-        loadFridgeItems('fridge-info-box');
-        loadFridgeItems('fridge-items-list');
-    } catch (error) {
-        console.error("Delete Fridge Item Error:", error);
-        alert(error.message);
-    }
-}
-
-
-function closeModal() {
-    $('#recipe-modal').modal('hide'); 
-}
-
-
-document.addEventListener("DOMContentLoaded", () => {
-  
-  document.getElementById("search-button").addEventListener("click", () => handleSearch(false));
-  document.getElementById("search-input").addEventListener("keyup", (event) => {
-    if (event.key === 'Enter') {
-      handleSearch(false);
-    } else {
-      handleKeyUp(event);
-    }
-  });
-
-  document.getElementById("prev-button").addEventListener("click", handlePrevClick);
-  document.getElementById("next-button").addEventListener("click", handleNextClick);
-  document.getElementById("close-modal").addEventListener("click", closeModal);
-  document.getElementById("close-modal-footer").addEventListener("click", closeModal);
-  document.getElementById("save-recipe").addEventListener("click", toggleSaveRemoveRecipe);
-
-  
-  const radioButtons = document.getElementsByName("search-type");
-  radioButtons.forEach(radio => {
-    radio.addEventListener("change", () => {
-      searchType = radio.value;
-      document.getElementById("autocomplete-suggestions").style.display = "none";
-      lastSearchQuery = "";
-      currentPage = 1;
-      document.getElementById("search-input").value = "";
-      document.getElementById("recipe-list").innerHTML = "";
-      document.getElementById("current-page").textContent = "Page 1";
-    });
-  });
-
-  // Close Error Message
-  const errorCloseButton = document.getElementById("error-close");
-  if (errorCloseButton) {
-    errorCloseButton.addEventListener("click", () => {
-      document.getElementById("error-message").style.display = "none";
-    });
+function restorePrefs() {
+  const saved = prefs.get("cook", {});
+  const mode = document.querySelector(`input[name="mode"][value="${saved.mode}"]`);
+  if (mode) mode.checked = true;
+  for (const diet of saved.diets || []) {
+    const box = document.querySelector(`input[name="diet"][value="${diet}"]`);
+    if (box) box.checked = true;
   }
+  byId("include-drinks").checked = Boolean(saved.drinks);
+}
 
-  loadFridgeItems('fridge-info-box'); 
-});
+function savePrefs() {
+  prefs.set("cook", { mode: currentMode(), diets: selectedDiets(), drinks: byId("include-drinks").checked });
+}
 
-function handleKeyUp(event) {
-  const query = event.target.value.trim();
+function bindEvents() {
+  document.querySelectorAll('input[name="mode"]').forEach((radio) =>
+    radio.addEventListener("change", () => { savePrefs(); applyMode(); }));
+
+  document.querySelectorAll('input[name="diet"], #include-drinks').forEach((box) =>
+    box.addEventListener("change", () => {
+      savePrefs();
+      if (state.mode === "fridge" || state.query) load(1);
+    }));
+
+  byId("search-form").addEventListener("submit", (e) => { e.preventDefault(); newSearch(); });
+
+  const input = byId("search-input");
+  const box = byId("suggestions");
+  input.addEventListener("input", debounce(showSuggestions, 200));
+  input.addEventListener("keydown", (e) => suggestionKeys(e, box, input));
+  box.addEventListener("keydown", (e) => suggestionKeys(e, box, input));
+  document.addEventListener("click", (e) => { if (!e.target.closest(".search-box")) box.hidden = true; });
+
+  byId("prev").addEventListener("click", () => load(state.page - 1, true));
+  byId("next").addEventListener("click", () => load(state.page + 1, true));
+  byId("surprise").addEventListener("click", surprise);
+}
+
+function applyMode() {
+  state.mode = currentMode();
+  state.query = "";
+  const searching = state.mode !== "fridge";
+  byId("search-form").hidden = !searching;
+  byId("suggestions").hidden = true;
+  if (searching) {
+    const input = byId("search-input");
+    input.value = "";
+    input.placeholder = PLACEHOLDERS[state.mode];
+    byId("results").replaceChildren();
+    byId("result-summary").textContent = "";
+    updatePager(0, 1, PER_PAGE);
+    input.focus();
+  } else {
+    load(1);
+  }
+}
+
+function newSearch() {
+  const query = byId("search-input").value.trim().replace(/,\s*$/, "");
   if (!query) {
-    document.getElementById("autocomplete-suggestions").style.display = "none";
+    toast("Type an ingredient or a recipe name first.", "warn");
     return;
   }
-
-  fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/autocomplete_recipes?q=${encodeURIComponent(query)}&type=${searchType}`, {
-    method: 'GET',
-    credentials: 'include'
-  })
-    .then(res => res.json())
-    .then(data => {
-      const suggestions = data.suggestions || [];
-      const suggestionsBox = document.getElementById("autocomplete-suggestions");
-      suggestionsBox.innerHTML = "";
-      if (!suggestions.length) {
-        suggestionsBox.style.display = "none";
-        return;
-      }
-      suggestions.forEach(s => {
-        const div = document.createElement("div");
-        div.classList.add("autocomplete-suggestion");
-        div.textContent = s;
-        div.addEventListener("click", () => {
-          document.getElementById("search-input").value = s;
-          suggestionsBox.style.display = "none";
-          handleSearch(false);
-        });
-        suggestionsBox.appendChild(div);
-      });
-      suggestionsBox.style.display = "block";
-    })
-    .catch(error => {
-      console.error("Autocomplete error:", error);
-      document.getElementById("autocomplete-suggestions").style.display = "none";
-    });
+  byId("suggestions").hidden = true;
+  state.query = query;
+  load(1);
 }
 
-
-async function handleSearch(isPagination = false) {
-  if (!isPagination) {
-    currentPage = 1;
-    lastSearchQuery = document.getElementById("search-input").value.trim();
+async function load(page, scroll = false) {
+  const params = filterParams();
+  params.set("page", page);
+  params.set("per_page", PER_PAGE);
+  let path = "/recipes/from_fridge?";
+  if (state.mode === "ingredients") {
+    params.set("ingredients", state.query);
+    path = "/search_recipes_by_ingredients?";
+  } else if (state.mode === "name") {
+    params.set("name", state.query);
+    path = "/search_recipes_by_name?";
   }
-  if (!lastSearchQuery) {
-    alert("Please enter a search term.");
-    return;
-  }
 
+  const seq = ++requestSeq;
+  showSkeleton(byId("results"), 8);
   try {
-    let url = "";
-    if (searchType === "ingredients") {
-      url = `https://recipes-flask-backend-521138187713.us-central1.run.app/search_recipes_by_ingredients?ingredients=${encodeURIComponent(lastSearchQuery)}`;
-    } else {
-      url = `https://recipes-flask-backend-521138187713.us-central1.run.app/search_recipes_by_name?name=${encodeURIComponent(lastSearchQuery)}`;
+    const data = await api(path + params);
+    if (seq !== requestSeq) return; // a newer request replaced this one
+    state.page = data.page;
+    render(data);
+    if (scroll) {
+      const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+      byId("result-summary").scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "start" });
     }
-
-    const response = await fetch(url, { method: 'GET', credentials: 'include' });
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error || "Failed to fetch recipes");
-    }
-    const data = await response.json();
-    displayRecipes(data.recipes);
-    updatePaginationControls(data.count > (currentPage * 20));
-  } catch (error) {
-    console.error("Search error:", error);
-    alert(error.message);
-  }
-}
-
-function displayRecipes(recipes) {
-  const recipeList = document.getElementById("recipe-list");
-  recipeList.innerHTML = "";
-
-  if (!recipes.length) {
-    recipeList.innerHTML = "<p class='text-center w-100'>No recipes found.</p>";
-    return;
-  }
-
-
-  const recipesToDisplay = recipes.slice((currentPage - 1) * 20, currentPage * 20);
-  recipesToDisplay.forEach(r => {
-    const column = document.createElement("div");
-    column.classList.add("col-md-3", "col-sm-6", "mb-4"); 
-
-    const card = document.createElement("div");
-    card.classList.add("card", "h-100", "recipe-card"); 
-    card.style.cursor = "pointer"; 
-    card.addEventListener("click", () => openRecipeModal(r.name));
-
-    // Card image
-    const img = document.createElement("img");
-    img.classList.add("card-img-top", "recipe-image"); 
-    img.src = r.image_url || "https://via.placeholder.com/250x180?text=No+Image";
-    img.alt = r.name;
-    img.onerror = () => {
-      img.src = "https://via.placeholder.com/250x180?text=No+Image";
-    };
-
-    card.appendChild(img);
-
-    // Card body
-    const cardBody = document.createElement("div");
-    cardBody.classList.add("card-body", "p-2"); 
-
-    const title = document.createElement("h5");
-    title.classList.add("card-title", "text-truncate"); 
-    title.textContent = r.name;
-
-    cardBody.appendChild(title);
-    card.appendChild(cardBody);
-
-    column.appendChild(card);
-    recipeList.appendChild(column);
-  });
-}
-
-function updatePaginationControls(hasMore) {
-  document.getElementById("current-page").textContent = `Page ${currentPage}`;
-  document.getElementById("prev-button").classList.toggle("disabled", currentPage === 1); 
-  document.getElementById("next-button").classList.toggle("disabled", !hasMore); 
-}
-
-function handlePrevClick() {
-  if (currentPage > 1) {
-    currentPage--;
-    handleSearch(true);
-  }
-}
-
-function handleNextClick() {
-  currentPage++;
-  handleSearch(true);
-}
-
-
-async function openRecipeModal(recipeName) {
-  try {
-    const detailUrl = `https://recipes-flask-backend-521138187713.us-central1.run.app/recipe_details_csv?name=${encodeURIComponent(recipeName)}`;
-    console.log("Fetching details from:", detailUrl);
-
-    const res = await fetch(detailUrl, { method: 'GET', credentials: 'include' });
-    if (!res.ok) {
-      const errorData = await res.json();
-      throw new Error(errorData.error || "Failed to fetch recipe details");
-    }
-    const data = await res.json();
-    const csvRecipe = data.recipe; 
-
-
-    const localImageUrl = csvRecipe.image_url || "https://via.placeholder.com/800x600?text=No+Image";
-
-
-    const youtubeUrl = await fetchYouTubeTutorial(csvRecipe.name);
-
-    const finalRecipe = {
-      recipe_id: csvRecipe.recipe_id,
-      name: csvRecipe.name,
-      ingredients: csvRecipe.ingredients,
-      instructions: csvRecipe.instructions,
-      image_url: localImageUrl,
-      youtube_url: youtubeUrl
-    };
-
-    const isSaved = await checkIfRecipeSaved(finalRecipe.recipe_id);
-
-    displayRecipeModal(finalRecipe, isSaved);
   } catch (err) {
-    console.error("Modal Fetch Error:", err);
-    alert(err.message);
+    if (seq !== requestSeq) return;
+    byId("results").replaceChildren();
+    toast(err.message, "error");
   }
 }
 
-async function checkIfRecipeSaved(recipeId) {
-  try {
-    const response = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/is_recipe_saved/${recipeId}`, {
-      method: 'GET',
-      credentials: 'include'
-    });
-    const data = await response.json();
-    return data.saved;
-  } catch (error) {
-    console.error("Check saved status error:", error);
-    return false;
-  }
-}
+function render(data) {
+  const results = byId("results");
+  const summary = byId("result-summary");
 
-function displayRecipeModal(recipe, isSaved) {
-  document.getElementById("modal-title").textContent = recipe.name;
-  document.getElementById("modal-image").src = recipe.image_url || "https://via.placeholder.com/800x600?text=No+Image";
-  document.getElementById("modal-ingredients").textContent = recipe.ingredients;
-  document.getElementById("modal-instructions").textContent = recipe.instructions;
-
-
-  const videoContainer = document.getElementById("modal-video");
-  videoContainer.innerHTML = "";
-  if (recipe.youtube_url) {
-    const iframe = document.createElement("iframe");
-    iframe.src = recipe.youtube_url;
-    iframe.width = "100%";
-    iframe.height = "315";
-    iframe.frameBorder = "0";
-    iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture";
-    iframe.allowFullscreen = true;
-    videoContainer.appendChild(iframe);
-  } else {
-    videoContainer.textContent = "No YouTube tutorial available.";
-  }
-
-
-  const modal = document.getElementById("recipe-modal");
-  modal.dataset.currentRecipeId = recipe.recipe_id;
-
-  // Update Save/Remove button based on saved status
-  const saveButton = document.getElementById("save-recipe");
-  saveButton.textContent = isSaved ? "Remove Recipe" : "Save Recipe";
-  saveButton.classList.toggle("btn-primary", !isSaved); 
-  saveButton.classList.toggle("btn-danger", isSaved); 
-
-  const newSaveButton = saveButton.cloneNode(true);
-  saveButton.parentNode.replaceChild(newSaveButton, saveButton);
-
-  if (isSaved) {
-    newSaveButton.addEventListener("click", removeRecipeFromModal);
-  } else {
-    newSaveButton.addEventListener("click", saveRecipe);
-  }
-
-  $('#recipe-modal').modal('show');
-
-}
-
-
-async function toggleSaveRemoveRecipe() {
-  const modal = document.getElementById("recipe-modal");
-  const recipeId = modal.dataset.currentRecipeId;
-  if (!recipeId) {
-    alert("No recipe selected.");
+  if (data.empty_fridge) {
+    summary.textContent = "";
+    results.replaceChildren(emptyState(
+      "Your fridge is empty",
+      "Add a few things you have at home and recipes that use them will show up here.",
+      el("a", { class: "btn btn-basil", href: "fridge.html" }, "Add fridge items")));
+    updatePager(0, 1, PER_PAGE);
     return;
   }
 
-  const saveButton = document.getElementById("save-recipe");
-  if (saveButton.textContent === "Save Recipe") {
-    await saveRecipe();
+  const n = data.count.toLocaleString();
+  if (state.mode === "fridge") {
+    summary.textContent = data.count ? `${n} recipes use something from your fridge. Closest matches first.` : "";
   } else {
-    await removeRecipeFromModal();
+    summary.textContent = data.count ? `${n} recipe${data.count === 1 ? "" : "s"} for “${state.query}”` : "";
   }
+
+  if (!data.recipes.length) {
+    const empty = state.mode === "fridge"
+      ? emptyState("No matches with these filters", "Turn a filter off, or add more items to your fridge.")
+      : emptyState(`Nothing found for “${state.query}”`,
+          state.mode === "ingredients"
+            ? "Try fewer ingredients, or a simpler word like “chicken” instead of “chicken breast”."
+            : "Try a shorter name, or search by ingredient instead.");
+    results.replaceChildren(empty);
+  } else {
+    renderRecipes(results, data.recipes);
+  }
+  updatePager(data.count, data.page, data.per_page || PER_PAGE);
 }
 
-async function saveRecipe() {
-  const modal = document.getElementById("recipe-modal");
-  const recipeId = modal.dataset.currentRecipeId;
-  if (!recipeId) {
-    alert("No recipe selected.");
-    return;
-  }
+function updatePager(count, page, perPage) {
+  const pages = Math.max(1, Math.ceil(count / perPage));
+  byId("pager").hidden = count <= perPage;
+  byId("page-label").textContent = `Page ${page} of ${pages}`;
+  byId("prev").disabled = page <= 1;
+  byId("next").disabled = page >= pages;
+}
 
-
-  const name = document.getElementById("modal-title").textContent;
-  const ingredients = document.getElementById("modal-ingredients").textContent;
-  const instructions = document.getElementById("modal-instructions").textContent;
-  const imgSrc = document.getElementById("modal-image").src;
-  const iframe = document.querySelector("#modal-video iframe");
-  const youtubeUrl = iframe ? iframe.src : "";
-
-  const payload = {
-    recipe_id: recipeId,
-    name,
-    ingredients,
-    instructions,
-    youtube_url: youtubeUrl,
-    image_url: imgSrc
-  };
-
+async function surprise() {
   try {
-    const saveRes = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/save_recipe`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      credentials: "include"
-    });
-    const saveData = await saveRes.json();
-    if (!saveRes.ok) {
-      throw new Error(saveData.error || "Failed to save recipe.");
-    }
-
-    const saveButton = document.getElementById("save-recipe");
-    saveButton.textContent = "Remove Recipe";
-    saveButton.classList.remove("btn-primary"); 
-    saveButton.classList.add("btn-danger"); 
-
-    // Update event listener
-    saveButton.removeEventListener("click", saveRecipe);
-    saveButton.addEventListener("click", removeRecipeFromModal);
+    const { recipe_id } = await api(`/recipes/random?${filterParams()}`);
+    openRecipeModal(recipe_id);
   } catch (err) {
-    console.error("Save Recipe Error:", err);
-    alert(err.message);
+    toast(err.message, "error");
   }
 }
 
-async function removeRecipeFromModal() {
-  const modal = document.getElementById("recipe-modal");
-  const recipeId = modal.dataset.currentRecipeId;
-  if (!recipeId) {
-    alert("No recipe selected.");
+async function showSuggestions() {
+  if (state.mode === "fridge") return;
+  const input = byId("search-input");
+  const box = byId("suggestions");
+  const term = state.mode === "ingredients" ? input.value.split(",").pop().trim() : input.value.trim();
+  if (term.length < 2) {
+    box.hidden = true;
     return;
   }
-
-
+  const seq = ++suggestSeq;
   try {
-    const response = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/unsave_recipe/${recipeId}`, {
-      method: 'DELETE',
-      credentials: 'include'
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || "Failed to remove recipe");
+    const params = new URLSearchParams({ type: state.mode, q: input.value });
+    const { suggestions } = await api(`/autocomplete_recipes?${params}`);
+    if (seq !== suggestSeq) return;
+    if (!suggestions.length) {
+      box.hidden = true;
+      return;
     }
-
-    alert(data.message || "Recipe removed successfully!");
-    $('#recipe-modal').modal('hide'); 
-    loadSavedRecipes();
-  } catch (error) {
-    console.error("Remove Recipe Error:", error);
-    alert(error.message);
+    box.replaceChildren(...suggestions.map((s) =>
+      el("button", { type: "button", class: "suggestion", role: "option", onclick: () => pickSuggestion(s) }, s)));
+    box.hidden = false;
+  } catch {
+    box.hidden = true;
   }
 }
 
-
-async function loadSavedRecipes() {
-    try {
-        const response = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/saved_recipes`, {
-            method: 'GET',
-            credentials: 'include'
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || "Failed to fetch saved recipes");
-        }
-
-        const recipes = await response.json();
-        displaySavedRecipes(recipes);
-    } catch (error) {
-        console.error("Load Saved Recipes Error:", error);
-        
-    }
+function pickSuggestion(s) {
+  const input = byId("search-input");
+  byId("suggestions").hidden = true;
+  if (state.mode === "ingredients") {
+    const parts = input.value.split(",");
+    parts[parts.length - 1] = s; // replace only the word being typed
+    input.value = parts.map((p) => p.trim()).filter(Boolean).join(", ") + ", ";
+    input.focus();
+  } else {
+    input.value = s;
+    newSearch();
+  }
 }
-
-function displaySavedRecipes(recipes) {
-    const savedRecipesList = document.getElementById("saved-recipes");
-    savedRecipesList.innerHTML = "";
-
-    if (!recipes.length) {
-        savedRecipesList.innerHTML = "<p class='text-center w-100'>No saved recipes.</p>"; 
-        return;
-    }
-
-    recipes.forEach(r => {
-        const column = document.createElement("div");
-        column.classList.add("col-md-3", "col-sm-6", "mb-4"); 
-
-        const card = document.createElement("div");
-        card.classList.add("card", "h-100", "recipe-card"); 
-        card.style.cursor = "pointer"; 
-        card.addEventListener("click", () => openRecipeModal(r.name));
-
-        // Card image
-        const img = document.createElement("img");
-        img.classList.add("card-img-top", "recipe-image"); 
-        img.src = r.image_url || "https://via.placeholder.com/250x180?text=No+Image";
-        img.alt = r.name;
-        img.onerror = () => {
-            img.src = "https://via.placeholder.com/250x180?text=No+Image";
-        };
-        card.appendChild(img);
-
-        // Card body
-        const cardBody = document.createElement("div");
-        cardBody.classList.add("card-body", "p-2"); 
-
-        const title = document.createElement("h5");
-        title.classList.add("card-title", "text-truncate"); 
-        title.textContent = r.name;
-
-        cardBody.appendChild(title);
-
-        
-        const removeButton = document.createElement("button");
-        removeButton.classList.add("btn", "btn-danger", "btn-sm", "mt-2"); 
-        removeButton.textContent = "Remove";
-        removeButton.addEventListener("click", (event) => {
-            event.stopPropagation(); 
-            confirmAndRemoveRecipe(r.recipe_id);
-        });
-
-        cardBody.appendChild(removeButton);
-        card.appendChild(cardBody);
-
-        column.appendChild(card);
-        savedRecipesList.appendChild(column);
-    });
-}
-
-async function confirmAndRemoveRecipe(recipeId) {
-    if (!confirm("Are you sure you want to remove this recipe from your saved list?")) return;
-
-    try {
-        const response = await fetch(`https://recipes-flask-backend-521138187713.us-central1.run.app/unsave_recipe/${recipeId}`, {
-            method: 'DELETE',
-            credentials: 'include'
-        });
-
-        const data = await response.json();
-        if (!response.ok) {
-            throw new Error(data.error || "Failed to remove recipe");
-        }
-
-
-        loadSavedRecipes();
-    } catch (error) {
-        console.error("Remove Recipe Error:", error);
-        alert(error.message);
-    }
-}
-
-
-document.addEventListener("DOMContentLoaded", () => {
-    const savedRecipesSection = document.getElementById("saved-recipes");
-    if (savedRecipesSection) {
-        loadSavedRecipes();
-    }
-});

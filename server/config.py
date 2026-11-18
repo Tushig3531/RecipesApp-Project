@@ -1,51 +1,94 @@
-import pathlib
 import os
+import pathlib
+from datetime import timedelta
+
 import dotenv
+import sqlalchemy as sa
 from flask import Flask
-from flask_cors import CORS 
-from flask_marshmallow import Marshmallow
+from flask_cors import CORS
 from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
 
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+dotenv.load_dotenv(BASE_DIR / ".env")
+dotenv.load_dotenv(BASE_DIR / ".flaskenv")
+
 db = SQLAlchemy()
-mm = Marshmallow()
+migrate = Migrate()
+
+IS_DEV = os.getenv("APP_ENV", "production").lower() == "development"
+
+DEFAULT_ORIGINS = [
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    "https://recipesapps.com",
+    "https://www.recipesapps.com",
+]
+
+# Columns added after tables already existed; create_all() won't add these by itself
+NEW_COLUMNS = {
+    "fridge_item": {"expires_on": "DATE"},
+}
+
+
+def _secret(name):
+    value = os.getenv(name)
+    if value:
+        return value
+    if IS_DEV:
+        return f"dev-only-{name.lower()}"
+    raise RuntimeError(f"{name} is not set. Add it to the Cloud Run service's environment variables.")
+
+
+def _database_url():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        name = os.getenv("FLASK_DATABASE_FILE", "recipe_database")
+        return f"sqlite:///{BASE_DIR / f'{name}.sqlite3'}"
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
+    return url
+
+
+def _env_list(name, default):
+    raw = os.getenv(name)
+    return [item.strip() for item in raw.split(",") if item.strip()] if raw else default
+
+
+def _add_missing_columns():
+    inspector = sa.inspect(db.engine)
+    for table, columns in NEW_COLUMNS.items():
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        for name, ddl in columns.items():
+            if name not in existing:
+                with db.engine.begin() as conn:
+                    conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
 
 def create_app():
-    this_app = Flask(__name__)
-    this_dir = pathlib.Path(__file__)
-    dotenv.load_dotenv(this_dir / pathlib.Path(".flaskenv"))
-    this_app.config.from_prefixed_env()
-    
-    db_file = this_dir.parent / pathlib.Path(
-        f"{this_app.config.get('FLASK_DATABASE_FILE', 'recipe_database')}.sqlite3"
+    app = Flask(__name__)
+    app.config.update(
+        SECRET_KEY=_secret("FLASK_SECRET_KEY"),
+        JWT_SECRET_KEY=_secret("FLASK_JWT_SECRET_KEY"),
+        SQLALCHEMY_DATABASE_URI=_database_url(),
+        SQLALCHEMY_ENGINE_OPTIONS={"pool_pre_ping": True},
+        JWT_TOKEN_LOCATION=["cookies"],
+        JWT_ACCESS_COOKIE_PATH="/",
+        JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=int(os.getenv("JWT_EXPIRES_HOURS", "24"))),
+        JWT_COOKIE_SECURE=os.getenv("JWT_COOKIE_SECURE", "true").lower() == "true",
+        JWT_COOKIE_SAMESITE=os.getenv("JWT_COOKIE_SAMESITE", "None"),
+        JWT_COOKIE_CSRF_PROTECT=False,  # CSRF handled by JSON-only writes in app.py
     )
-    this_app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "default_secret")
-    this_app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_file}"
-    this_app.config["JWT_SECRET_KEY"] = os.getenv("FLASK_JWT_SECRET_KEY", "default_jwt_secret")
-    this_app.config["SQLALCHEMY_ECHO"] = os.getenv("FLASK_SQLALCHEMY_ECHO", False)
-    this_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = os.getenv("FLASK_SQLALCHEMY_TRACK_MODIFICATIONS", False)
-    
-    CORS(
-        this_app,
-        resources={r"/*": {"origins": [
-            "http://localhost:5500",
-            "http://127.0.0.1:5500",
-            "http://[::]:5500"
-            "https://your-netlify-subdomain.netlify.app",
-            "https://recipesapps.com",
-            "https://www.recipesapps.com"
-            "https://recipes-flask-backend-521138187713.us-central1.run.app"
-        ]}},
-        supports_credentials=True
-    )
-    
-    db.init_app(this_app)
-    mm.init_app(this_app)
-    
-    from model import User, Recipe, SavedRecipe, FridgeItem
-    migrate = Migrate(this_app, db)
-    if not db_file.exists():
-        with this_app.app_context():
-            db.create_all()
-    
-    return this_app
+
+    CORS(app, origins=_env_list("CORS_ORIGINS", DEFAULT_ORIGINS), supports_credentials=True)
+
+    db.init_app(app)
+    migrate.init_app(app, db)
+
+    with app.app_context():
+        import model  # noqa: F401  registers tables
+        db.create_all()
+        _add_missing_columns()
+
+    return app

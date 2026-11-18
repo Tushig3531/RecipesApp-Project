@@ -1,0 +1,8 @@
+.env
+.flaskenv
+.git
+__pycache__/
+*.pyc
+venv/
+.venv/
+tests/

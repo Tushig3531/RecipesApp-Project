@@ -1,553 +1,576 @@
-import os
-import sys
-import pathlib
-import pandas as pd
-import requests
-import dotenv
-import csv
-import re
+"""RecipesApp API."""
 import logging
-from googleapiclient.discovery import build  
+import os
+import re
+import time
+from collections import defaultdict, deque
+from datetime import date, timedelta
 
-from flask import Flask, request, jsonify, url_for, render_template
+import requests
+from flask import jsonify, request
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import (
     JWTManager, create_access_token, get_jwt_identity,
-    jwt_required, set_access_cookies, unset_jwt_cookies
+    jwt_required, set_access_cookies, unset_jwt_cookies,
 )
-from datetime import datetime, timedelta
+from sqlalchemy.exc import IntegrityError
 
-
+import catalog
 from config import create_app, db
-from model import User, Recipe, SavedRecipe, FridgeItem
-from flask import send_from_directory
+from model import FridgeItem, Recipe, SavedRecipe, ShoppingItem, User
 
-
-dotenv.load_dotenv()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("recipesapp")
 
 app = create_app()
-
-
 bcrypt = Bcrypt(app)
-
-app.config["JWT_TOKEN_LOCATION"] = ["cookies"]
-app.config["JWT_ACCESS_COOKIE_PATH"] = "/"
-app.config["JWT_COOKIE_SECURE"] = True  
-app.config["JWT_COOKIE_SAMESITE"] = "None"
-app.config["JWT_COOKIE_CSRF_PROTECT"] = False 
-JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1)  
-JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=7)
 jwt = JWTManager(app)
 
+catalog.load()
+catalog.load_items()
 
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.json
-    if not data:
-        return jsonify({"error": "No data"}), 400
-
-    existing_user = User.query.filter_by(email=data['email']).first()
-    if existing_user:
-        return jsonify({"error": "Email already registered"}), 400
-
-    hashed_password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
-    new_user = User(username=data['username'], email=data['email'], password=hashed_password)
-    db.session.add(new_user)
-    db.session.commit()
-    return jsonify({"message": "User registered successfully!"}), 201
-
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    if not data or not data.get('email') or not data.get('password'):
-        return jsonify({"error": "Email and password are required."}), 400
-
-    user = User.query.filter_by(email=data['email']).first()
-    if user and bcrypt.check_password_hash(user.password, data['password']):
-        access_token = create_access_token(identity=str(user.id))
-        response = jsonify({"message": "Login successful!"})
-        set_access_cookies(response, access_token)
-        return response, 200
-    else:
-        return jsonify({"error": "Invalid credentials."}), 401
-    
-@app.route('/logout', methods=['POST'])
-@jwt_required()
-def logout():
-    response = jsonify({"message": "Logged out successfully"})
-    unset_jwt_cookies(response)
-    return response, 200
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_PER_PAGE = 48
+DIETS = {"vegetarian", "vegan"}
+KINDS = {"food", "drinks", "all"}
+USE_SOON_DAYS = 3
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_FAILURES = 8
+_failed_logins = defaultdict(deque)
 
 
-@app.route('/protected', methods=['GET'])
-@jwt_required()
-def protected():
-    try:
-        user_id = get_jwt_identity()
-        user = User.query.get(int(user_id))
-        if not user:
-            return jsonify({'message': 'User not found'}), 404
-        return jsonify({
-            'message': 'This is a protected route',
-            'user': {
-                'id': user.id,
-                'username': user.username
-            }
-        })
-    except Exception as e:
-        return jsonify({'message': f'Token validation failed: {str(e)}'}), 422
+# ---------- helpers ----------
+
+def error(message, status):
+    return jsonify({"error": message}), status
 
 
+def body():
+    return request.get_json(silent=True) or {}
 
-def load_recipes_from_csv():
-    recipes = []
-    filename = os.path.join(os.path.dirname(__file__), "Food.csv")
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8-sig") as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    recipe_id = row.get("recipe_id")
-                    if recipe_id is None or not recipe_id.strip().isdigit():
-                        logging.warning(f"Invalid recipe_id found: {recipe_id}. Generating new ID.")
-                        recipe_id = len(recipes) + 1
-                    else:
-                        recipe_id = int(recipe_id)
 
-                    recipes.append({
-                        "recipe_id": recipe_id,
-                        "name": row["Title"].strip(),
-                        "ingredients": row["Ingredients"].strip(),
-                        "instructions": row["Instructions"].strip(),
-                        "image_name": row["Image_Name"].strip(),
-                    })
-        except Exception as e:
-            logging.error(f"Error reading CSV: {e}")
-    else:
-        logging.error("Food.csv does not exist.")
-    logging.info(f"Loaded {len(recipes)} recipes from CSV.")
-    return recipes
+def clean_str(value, max_len):
+    return value.strip()[:max_len] if isinstance(value, str) else ""
 
-def get_image_url(image_name):
-    if not image_name:
+
+def current_user_id():
+    return int(get_jwt_identity())
+
+
+def parse_date(value):
+    if value in (None, ""):
+        return None
+    return date.fromisoformat(str(value))
+
+
+def paginate(items, serialize):
+    page = max(request.args.get("page", 1, type=int), 1)
+    per_page = min(max(request.args.get("per_page", 24, type=int), 1), MAX_PER_PAGE)
+    start = (page - 1) * per_page
+    return {
+        "recipes": [serialize(x) for x in items[start:start + per_page]],
+        "count": len(items),
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+def recipe_pool():
+    diets = [d for d in request.args.get("diet", "").split(",") if d in DIETS]
+    kind = request.args.get("kind", "food")
+    return catalog.filtered(diets, kind if kind in KINDS else "food")
+
+
+def fridge_matchers(user_id):
+    """Regex for everything in the user's fridge, and one for items to use soon."""
+    items = FridgeItem.query.filter_by(user_id=user_id).all()
+    soon = date.today() + timedelta(days=USE_SOON_DAYS)
+    everything = catalog.matcher(i.item_name for i in items)
+    expiring = catalog.matcher(i.item_name for i in items if i.expires_on and i.expires_on <= soon)
+    return everything, expiring
+
+
+def recipe_row(recipe):
+    row = Recipe.query.filter_by(recipe_id=recipe["recipe_id"]).first()
+    if row is None:
+        row = Recipe(
+            recipe_id=recipe["recipe_id"],
+            name=recipe["name"][:255],
+            ingredients="\n".join(recipe["ingredients"]),
+            instructions="\n".join(recipe["steps"]),
+            image_url=recipe["image_url"],
+        )
+        db.session.add(row)
+        db.session.flush()
+    return row
+
+
+def saved_entry(user_id, recipe_id):
+    return (SavedRecipe.query
+            .join(Recipe, SavedRecipe.recipe_id == Recipe.id)
+            .filter(SavedRecipe.user_id == user_id, Recipe.recipe_id == recipe_id)
+            .first())
+
+
+def fridge_dict(item):
+    return {
+        "id": item.id,
+        "item_name": item.item_name,
+        "brand": "" if item.brand in (None, "No Brand") else item.brand,
+        "quantity": item.quantity,
+        "expires_on": item.expires_on.isoformat() if item.expires_on else None,
+    }
+
+
+def shopping_dict(item):
+    return {
+        "id": item.id,
+        "text": item.text,
+        "term": item.term,
+        "recipe_name": item.recipe_name or "",
+        "checked": item.checked,
+    }
+
+
+def find_youtube_video(title):
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
         return ""
-    return f"https://storage.googleapis.com/recipesapp-images1/{image_name}.png"
+    try:
+        resp = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={"part": "snippet", "type": "video", "videoEmbeddable": "true",
+                    "maxResults": 1, "q": f"{title} recipe", "key": api_key},
+            timeout=5,
+        )
+    except requests.RequestException as exc:
+        log.warning("YouTube search failed for %r: %s", title, type(exc).__name__)
+        return ""
+    if resp.status_code != 200:  # don't log the URL, it contains the key
+        log.warning("YouTube search returned %s for %r", resp.status_code, title)
+        return ""
+    items = resp.json().get("items", [])
+    return items[0].get("id", {}).get("videoId", "") if items else ""
 
 
-
-def search_recipes_from_csv_by_ingredients(ingredient_string):
-    ingredient_list = [ing.strip().lower() for ing in ingredient_string.split(",") if ing.strip()]
-
-    results = []
-    csv_path = os.path.join(os.path.dirname(__file__), "Food.csv")
-    if not os.path.isfile(csv_path):
-        logging.error("Food.csv not found.")
-        return results
-
-    with open(csv_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_ingredients = row.get("Ingredients", "").lower()
-            if all(ing in row_ingredients for ing in ingredient_list):
-                image_name = row.get("Image_Name", "").strip()
-                image_url = get_image_url(image_name)
-                results.append({
-                    "recipe_id": row.get("recipe_id", "0"),
-                    "name": row.get("Title", "Untitled"),
-                    "ingredients": row.get("Ingredients", ""),
-                    "instructions": row.get("Instructions", ""),
-                    "image_url": image_url,
-                    "youtube_url": ""  
-                })
-    return results
-
-def search_recipes_from_csv_by_name(name_query):
-    
-    name_query = name_query.strip().lower()
-    results = []
-    csv_path = os.path.join(os.path.dirname(__file__), "Food.csv")
-    if not os.path.isfile(csv_path):
-        logging.error("Food.csv not found.")
-        return results
-
-    with open(csv_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_name = row.get("Title", "").lower()
-            if name_query in row_name:
-                image_name = row.get("Image_Name", "").strip()
-                image_url = get_image_url(image_name)
-                results.append({
-                    "recipe_id": row.get("recipe_id", "0"),
-                    "name": row.get("Title", "Untitled"),
-                    "ingredients": row.get("Ingredients", ""),
-                    "instructions": row.get("Instructions", ""),
-                    "image_url": image_url,
-                    "youtube_url": "",
-                })
-    return results
-
-def get_recipe_details_from_csv(recipe_name):
-
-    if not recipe_name:
-        return None
-
-    csv_path = os.path.join(os.path.dirname(__file__), "Food.csv")
-    if not os.path.isfile(csv_path):
-        logging.error("Food.csv not found.")
-        return None
-
-    recipe_name_lower = recipe_name.strip().lower()
-    with open(csv_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Compare ignoring case
-            row_title = row.get("Title", "").strip().lower()
-            if row_title == recipe_name_lower:
-                image_name = row.get("Image_Name", "").strip()
-                image_url = get_image_url(image_name)
-                return {
-                    "recipe_id": row.get("recipe_id", "0"),
-                    "name": row.get("Title", ""),
-                    "ingredients": row.get("Ingredients", ""),
-                    "instructions": row.get("Instructions", ""),
-                    "image_url": image_url,
-                    "youtube_url": ""
-                }
-    return None
-
-@app.route("/debug_load_csv", methods=["GET"])
-def debug_load_csv():
-    recipes = load_recipes_from_csv()
-    return jsonify(recipes)
-
-@app.route("/list_recipes", methods=["GET"])
-def list_recipes():
-    all_recipes = Recipe.query.all()
-    return jsonify([r.to_dict() for r in all_recipes])
+def _recent_failures(key):
+    attempts = _failed_logins[key]
+    cutoff = time.monotonic() - LOGIN_WINDOW_SECONDS
+    while attempts and attempts[0] < cutoff:
+        attempts.popleft()
+    return attempts
 
 
+# ---------- guards & errors ----------
 
-@app.route('/search_recipes_by_ingredients', methods=['GET'])
+@app.before_request
+def require_json_on_writes():
+    # Other sites can post plain HTML forms with the user's cookie, but they can't send
+    # Content-Type: application/json without a CORS preflight, which CORS rejects.
+    if request.method in ("POST", "PUT", "PATCH") and request.endpoint != "logout" and not request.is_json:
+        return error("Requests must be JSON.", 415)
+
+
+@jwt.unauthorized_loader
+@jwt.invalid_token_loader
+def not_logged_in(_reason):
+    return error("Please log in.", 401)
+
+
+@jwt.expired_token_loader
+def session_expired(_header, _payload):
+    return error("Your session expired. Please log in again.", 401)
+
+
+@app.errorhandler(404)
+def not_found(_):
+    return error("Not found.", 404)
+
+
+@app.errorhandler(405)
+def method_not_allowed(_):
+    return error("Method not allowed.", 405)
+
+
+@app.errorhandler(500)
+def server_error(_):
+    db.session.rollback()
+    return error("Something went wrong on our end. Please try again.", 500)
+
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok", "recipes": catalog.count()})
+
+
+# ---------- auth ----------
+
+@app.post("/register")
+def register():
+    data = body()
+    username = clean_str(data.get("username"), 200)
+    email = clean_str(data.get("email"), 200).lower()
+    password = data.get("password") if isinstance(data.get("password"), str) else ""
+
+    if not username or not email or not password:
+        return error("Username, email and password are required.", 400)
+    if len(username) > 80:
+        return error("Username must be 80 characters or fewer.", 400)
+    if len(email) > 120 or not EMAIL_RE.match(email):
+        return error("Enter a valid email address.", 400)
+    if len(password) < 8 or len(password.encode()) > 72:
+        return error("Password must be 8 to 72 characters.", 400)
+    if User.query.filter(db.func.lower(User.email) == email).first():
+        return error("That email already has an account. Log in instead.", 409)
+    if User.query.filter_by(username=username).first():
+        return error("That username is taken. Try another.", 409)
+
+    db.session.add(User(username=username, email=email,
+                        password=bcrypt.generate_password_hash(password).decode()))
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return error("That username or email is already registered.", 409)
+    return jsonify({"message": "Account created."}), 201
+
+
+@app.post("/login")
+def login():
+    data = body()
+    email = clean_str(data.get("email"), 200).lower()
+    password = data.get("password") if isinstance(data.get("password"), str) else ""
+    if not email or not password:
+        return error("Email and password are required.", 400)
+
+    failures = _recent_failures(email)
+    if len(failures) >= LOGIN_MAX_FAILURES:
+        return error("Too many failed attempts. Wait 15 minutes and try again.", 429)
+
+    user = User.query.filter(db.func.lower(User.email) == email).first()
+    if not user or not bcrypt.check_password_hash(user.password, password):
+        failures.append(time.monotonic())
+        return error("Email or password is incorrect.", 401)
+
+    _failed_logins.pop(email, None)
+    resp = jsonify({"user": {"id": user.id, "username": user.username}})
+    set_access_cookies(resp, create_access_token(identity=str(user.id)))
+    return resp, 200
+
+
+@app.post("/logout")
+def logout():
+    resp = jsonify({"message": "Logged out."})
+    unset_jwt_cookies(resp)
+    return resp, 200
+
+
+@app.get("/me")
 @jwt_required()
-def search_recipes_by_ingredients_csv():
-    ingredients = request.args.get('ingredients', '').strip()
-    if not ingredients:
-        return jsonify({"error": "No ingredients provided."}), 400
-    matching_recipes = search_recipes_from_csv_by_ingredients(ingredients)
-    return jsonify({"recipes": matching_recipes, "count": len(matching_recipes)}), 200
+def me():
+    user_id = current_user_id()
+    user = db.session.get(User, user_id)
+    if not user:
+        return error("Please log in.", 401)
+    return jsonify({
+        "user": {"id": user.id, "username": user.username},
+        "counts": {
+            "fridge": FridgeItem.query.filter_by(user_id=user_id).count(),
+            "shopping": ShoppingItem.query.filter_by(user_id=user_id, checked=False).count(),
+        },
+    })
 
-@app.route('/search_recipes_by_name', methods=['GET'])
+
+# ---------- recipes ----------
+
+@app.get("/search_recipes_by_ingredients")
 @jwt_required()
-def search_recipes_by_name_csv():
-    name = request.args.get('name', '').strip()
+def search_by_ingredients():
+    terms = [t.strip().lower() for t in request.args.get("ingredients", "").split(",") if t.strip()]
+    if not terms:
+        return error("Enter at least one ingredient.", 400)
+    have, _ = fridge_matchers(current_user_id())
+    results = catalog.search_by_ingredients(terms, recipe_pool())
+    return jsonify(paginate(results, lambda r: catalog.summary(r, have)))
+
+
+@app.get("/search_recipes_by_name")
+@jwt_required()
+def search_by_name():
+    name = request.args.get("name", "").strip()
     if not name:
-        return jsonify({"error": "No recipe name provided."}), 400
-    matching_recipes = search_recipes_from_csv_by_name(name)
-    return jsonify({"recipes": matching_recipes, "count": len(matching_recipes)}), 200
+        return error("Enter a recipe name.", 400)
+    have, _ = fridge_matchers(current_user_id())
+    results = catalog.search_by_name(name, recipe_pool())
+    return jsonify(paginate(results, lambda r: catalog.summary(r, have)))
 
 
-
-
-@app.route('/autocomplete_recipes', methods=['GET'])
+@app.get("/autocomplete_recipes")
 @jwt_required()
 def autocomplete_recipes():
-
-    query = request.args.get('q', '').strip().lower()
-    search_type = request.args.get('type', 'ingredient')
-
-    if not query:
-        return jsonify({"suggestions": []}), 200
-
-    if search_type == 'ingredient':
-        recipes = Recipe.query.filter(Recipe.ingredients.ilike(f"%{query}%")).all()
-        suggestions = []
-        for r in recipes:
-            ing_list = re.findall(r"[A-Za-z0-9\-]+", r.ingredients.lower())
-            for ing in ing_list:
-                if query in ing and ing not in suggestions:
-                    suggestions.append(ing)
-        return jsonify({"suggestions": suggestions[:10]}), 200
-    elif search_type == 'name':
-        # DB-based
-        recipes = Recipe.query.filter(Recipe.name.ilike(f"%{query}%")).all()
-        suggestions = []
-        for r in recipes:
-            if query in r.name.lower() and r.name not in suggestions:
-                suggestions.append(r.name)
-        return jsonify({"suggestions": suggestions[:10]}), 200
+    query = request.args.get("q", "")
+    if request.args.get("type", "ingredients") in ("ingredient", "ingredients"):
+        suggestions = catalog.suggest_ingredients(query.split(",")[-1])
     else:
-        return jsonify({"suggestions": []}), 200
+        suggestions = catalog.suggest_names(query)
+    return jsonify({"suggestions": suggestions})
 
 
-@app.route("/recipe_details_csv", methods=["GET"])
-def get_recipe_details_csv():
-    recipe_name = request.args.get("name", "").strip().lower()
-    if not recipe_name:
-        return jsonify({"error": "Recipe name is required"}), 400
-
-    csv_path = os.path.join(os.path.dirname(__file__), "Food.csv")
-    if not os.path.isfile(csv_path):
-        return jsonify({"error": "Food.csv not found"}), 500
-
-    with open(csv_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            
-            row_title = row.get("Title", "").strip().lower()
-            if row_title == recipe_name:
-                image_name = row.get("Image_Name", "").strip()
-                image_url = get_image_url(image_name)
-                
-                return jsonify({
-                    "recipe": {
-                        "recipe_id": row.get("recipe_id", "0"),
-                        "name": row.get("Title", ""),
-                        "ingredients": row.get("Ingredients", ""),
-                        "instructions": row.get("Instructions", ""),
-                        "image_url": image_url,
-                        "youtube_url": ""
-                    }
-                }), 200
-
-    return jsonify({"error": "No recipe found with the given name."}), 404
+@app.get("/recipes/from_fridge")
+@jwt_required()
+def recipes_from_fridge():
+    have, expiring = fridge_matchers(current_user_id())
+    if have is None:
+        return jsonify({"recipes": [], "count": 0, "page": 1, "per_page": 24, "empty_fridge": True})
+    ranked = catalog.rank_by_fridge(recipe_pool(), have, expiring)
+    return jsonify(paginate(ranked, lambda r: {
+        **catalog.summary(r, have),
+        "missing": catalog.missing_terms(r, have)[:4],
+    }))
 
 
+@app.get("/recipes/random")
+@jwt_required()
+def random_recipe():
+    recipe = catalog.random_from(recipe_pool())
+    if not recipe:
+        return error("No recipes match those filters.", 404)
+    return jsonify({"recipe_id": recipe["recipe_id"]})
 
-@app.route('/save_recipe', methods=['POST'])
+
+@app.get("/recipes/<int:recipe_id>")
+@jwt_required()
+def recipe_detail(recipe_id):
+    recipe = catalog.get(recipe_id)
+    if not recipe:
+        return error("Recipe not found.", 404)
+    user_id = current_user_id()
+    have, _ = fridge_matchers(user_id)
+    status = catalog.ingredient_status(recipe, have)
+    return jsonify({
+        "recipe": catalog.public(recipe),
+        "saved": saved_entry(user_id, recipe_id) is not None,
+        "status": status,
+        "have": status.count("have"),
+        "total": status.count("have") + status.count("missing"),
+    })
+
+
+@app.get("/recipes/<int:recipe_id>/video")
+@jwt_required()
+def recipe_video(recipe_id):
+    recipe = catalog.get(recipe_id)
+    if not recipe:
+        return error("Recipe not found.", 404)
+    row = recipe_row(recipe)
+    if not row.youtube_url:
+        video_id = find_youtube_video(recipe["name"])
+        if video_id:
+            row.youtube_url = f"https://www.youtube.com/embed/{video_id}"
+    db.session.commit()
+    return jsonify({"youtube_url": row.youtube_url or ""})
+
+
+@app.post("/recipes/<int:recipe_id>/shopping")
+@jwt_required()
+def add_missing_to_shopping(recipe_id):
+    recipe = catalog.get(recipe_id)
+    if not recipe:
+        return error("Recipe not found.", 404)
+    user_id = current_user_id()
+    have, _ = fridge_matchers(user_id)
+    on_list = {s.term for s in ShoppingItem.query.filter_by(user_id=user_id, checked=False).all()}
+    added = 0
+    rows = zip(recipe["ingredients"], catalog.terms(recipe), catalog.ingredient_status(recipe, have))
+    for line, term, status in rows:
+        term = term[:100]
+        if status == "missing" and term not in on_list:
+            db.session.add(ShoppingItem(user_id=user_id, text=line[:200], term=term,
+                                        recipe_name=recipe["name"][:255]))
+            on_list.add(term)
+            added += 1
+    db.session.commit()
+    return jsonify({"added": added}), 201
+
+
+@app.post("/save_recipe")
 @jwt_required()
 def save_recipe():
-    user_id = get_jwt_identity()
-    data = request.json
+    try:
+        recipe_id = int(body().get("recipe_id"))
+    except (TypeError, ValueError):
+        return error("recipe_id is required.", 400)
+    recipe = catalog.get(recipe_id)
+    if not recipe:
+        return error("Recipe not found.", 404)
 
-    external_id = data.get('recipe_id')
-    if not external_id:
-        return jsonify({"error": "recipe_id is required"}), 400
-    
-    existing_recipe = Recipe.query.filter_by(recipe_id=external_id).first()
-    if not existing_recipe:
-        existing_recipe = Recipe(
-            recipe_id=int(external_id),
-            name=data.get('name', 'Untitled'),
-            ingredients=data.get('ingredients', ''),
-            instructions=data.get('instructions', ''),
-            youtube_url=data.get('youtube_url', ''),
-            image_url=data.get('image_url', '')
-        )
-        db.session.add(existing_recipe)
+    user_id = current_user_id()
+    row = recipe_row(recipe)
+    if SavedRecipe.query.filter_by(user_id=user_id, recipe_id=row.id).first():
         db.session.commit()
+        return jsonify({"message": "Already saved."}), 200
+
+    db.session.add(SavedRecipe(user_id=user_id, recipe_id=row.id))
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"message": "Already saved."}), 200
+    return jsonify({"message": "Saved."}), 201
 
 
-    from_user = User.query.get(int(user_id))  
-    if not from_user:
-        return jsonify({"error": "User not found"}), 400
-
-    already_saved = SavedRecipe.query.filter_by(user_id=int(user_id), recipe_id=existing_recipe.id).first()
-    if already_saved:
-        return jsonify({"message": "Recipe already saved"}), 400
-
-    new_saved = SavedRecipe(user_id=int(user_id), recipe_id=existing_recipe.id)
-    db.session.add(new_saved)
-    db.session.commit()
-    return jsonify({"message": "Recipe saved successfully!"}), 201
-
-@app.route('/unsave_recipe/<int:recipe_id>', methods=['DELETE'])
+@app.delete("/unsave_recipe/<int:recipe_id>")
 @jwt_required()
 def unsave_recipe(recipe_id):
-    user_id = get_jwt_identity()
-    
-    
-    recipe = Recipe.query.filter_by(recipe_id=recipe_id).first()
-    if not recipe:
-        return jsonify({"error": "Recipe not found."}), 404
-    
-    
-    saved_recipe = SavedRecipe.query.filter_by(user_id=int(user_id), recipe_id=recipe.id).first()
-    if not saved_recipe:
-        return jsonify({"error": "Recipe not saved."}), 400
-    
-    
-    db.session.delete(saved_recipe)
+    entry = saved_entry(current_user_id(), recipe_id)
+    if not entry:
+        return error("That recipe isn't in your saved list.", 404)
+    db.session.delete(entry)
     db.session.commit()
-    
-    return jsonify({"message": "Recipe removed successfully!"}), 200
+    return jsonify({"message": "Removed."})
 
-@app.route('/saved_recipes', methods=['GET'])
+
+@app.get("/saved_recipes")
 @jwt_required()
-def get_saved_recipes():
-    
-    user_id = get_jwt_identity()
-    saved_list = SavedRecipe.query.filter_by(user_id=int(user_id)).all()
-
-    recipes = []
-    for sr in saved_list:
-        r = Recipe.query.get(sr.recipe_id)
-        if r:
-            recipes.append(r.to_dict())
-    return jsonify(recipes), 200
-
-@app.route('/is_recipe_saved/<int:recipe_id>', methods=['GET'])
-@jwt_required()
-def is_recipe_saved(recipe_id):
-    user_id = get_jwt_identity()
-    recipe = Recipe.query.filter_by(recipe_id=recipe_id).first()
-    if not recipe:
-        return jsonify({"saved": False}), 200
-    saved = SavedRecipe.query.filter_by(user_id=int(user_id), recipe_id=recipe.id).first()
-    return jsonify({"saved": bool(saved)}), 200
+def saved_recipes():
+    user_id = current_user_id()
+    rows = (db.session.query(Recipe.recipe_id)
+            .join(SavedRecipe, SavedRecipe.recipe_id == Recipe.id)
+            .filter(SavedRecipe.user_id == user_id)
+            .order_by(SavedRecipe.id.desc())
+            .all())
+    have, _ = fridge_matchers(user_id)
+    recipes = [catalog.get(rid) for (rid,) in rows]
+    return jsonify([catalog.summary(r, have) for r in recipes if r])
 
 
+# ---------- fridge ----------
 
-
-
-def load_items_from_csv_Item():
-    items = []
-    filename = os.path.join(os.path.dirname(__file__), "Item.csv")
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8-sig") as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    items.append(row["ItemName"])
-        except Exception as e:
-            print(f"Error reading CSV: {e}")
-    else:
-        print("Item.csv does not exist.")
-    return items
-
-@app.route("/fridge/search_items_fridge", methods=["GET"])
+@app.get("/fridge/search_items_fridge")
 @jwt_required()
 def search_items_fridge():
-    query = request.args.get("q", "").lower()
-    if not query:
-        return jsonify({})
+    return jsonify(catalog.search_items(request.args.get("q", "")))
 
-    csv_items = load_items_from_csv_Item()
-    results = {}
-    for item in csv_items:
-        if query in item.lower():
-            match = re.match(r"^(.*?)\s*\((.*?)\)", item)
-            if match:
-                keyword, item_type = match.groups()
-                results.setdefault(keyword.strip(), []).append(item_type.strip())
-            else:
-                results.setdefault(item.strip(), []).append("")
-    return jsonify(results)
 
-@app.route('/fridge', methods=['GET'])
+@app.get("/fridge")
 @jwt_required()
-def get_fridge_items():
-    user_id = get_jwt_identity()
-    items = FridgeItem.query.filter_by(user_id=int(user_id)).all()
-    result = []
-    for item in items:
-        result.append({
-            "id": item.id,
-            "item_name": item.item_name,
-            "brand": item.brand,
-            "quantity": item.quantity,
-            "date_added": item.date_added.strftime("%Y-%m-%d %H:%M:%S")
-        })
-    return jsonify(result), 200
+def get_fridge():
+    items = (FridgeItem.query.filter_by(user_id=current_user_id())
+             .order_by(FridgeItem.expires_on.is_(None), FridgeItem.expires_on, FridgeItem.date_added.desc())
+             .all())
+    return jsonify([fridge_dict(i) for i in items])
 
-@app.route('/fridge/add', methods=['POST'])
+
+@app.post("/fridge/add")
 @jwt_required()
 def add_fridge_item():
-    user_id = get_jwt_identity()
-    data = request.json
-    item_name = data.get("item_name")
-    brand = data.get("brand", "No Brand")
-    quantity = data.get("quantity", "0 items")
-    if not item_name:
-        return jsonify({"error": "Item name is required"}), 400
-    new_item = FridgeItem(
-        user_id=int(user_id),
-        item_name=item_name,
-        brand=brand,
-        quantity=quantity,
-        date_added=datetime.utcnow()
-    )
-    db.session.add(new_item)
+    data = body()
+    name = clean_str(data.get("item_name"), 100)
+    quantity = clean_str(data.get("quantity"), 50)
+    if not name:
+        return error("Type or pick an item.", 400)
+    if not quantity:
+        return error("Enter how much you have.", 400)
+    try:
+        expires_on = parse_date(data.get("expires_on"))
+    except ValueError:
+        return error("Use-by date must look like 2026-11-30.", 400)
+    item = FridgeItem(user_id=current_user_id(), item_name=name, quantity=quantity,
+                      brand=clean_str(data.get("brand"), 100) or None, expires_on=expires_on)
+    db.session.add(item)
     db.session.commit()
-    return jsonify({
-        "id": new_item.id,
-        "item_name": new_item.item_name,
-        "brand": new_item.brand,
-        "quantity": new_item.quantity,
-        "date_added": new_item.date_added.strftime("%Y-%m-%d %H:%M:%S")
-    }), 201
+    return jsonify(fridge_dict(item)), 201
 
-@app.route('/fridge/edit/<int:item_id>', methods=['POST'])
+
+@app.patch("/fridge/<int:item_id>")
 @jwt_required()
-def edit_fridge_item(item_id):
-    
-    user_id = get_jwt_identity()
-    data = request.json
-
-    item = FridgeItem.query.filter_by(id=item_id, user_id=int(user_id)).first()
+def update_fridge_item(item_id):
+    item = FridgeItem.query.filter_by(id=item_id, user_id=current_user_id()).first()
     if not item:
-        return jsonify({"error": "Item not found or not yours"}), 404
-
-    new_quantity = data.get("quantity")
-    new_brand = data.get("brand")
-    new_name = data.get("item_name")
-
-    if new_quantity is not None:
-        item.quantity = new_quantity
-    if new_brand is not None:
-        item.brand = new_brand
-    if new_name is not None:
-        item.item_name = new_name
-
+        return error("Item not found.", 404)
+    data = body()
+    for field, max_len, label in (("item_name", 100, "Item name"), ("quantity", 50, "Quantity")):
+        if field in data:
+            value = clean_str(data[field], max_len)
+            if not value:
+                return error(f"{label} can't be empty.", 400)
+            setattr(item, field, value)
+    if "brand" in data:
+        item.brand = clean_str(data["brand"], 100) or None
+    if "expires_on" in data:
+        try:
+            item.expires_on = parse_date(data["expires_on"])
+        except ValueError:
+            return error("Use-by date must look like 2026-11-30.", 400)
     db.session.commit()
-    return jsonify({"message": "Item updated successfully!"}), 200
+    return jsonify(fridge_dict(item))
 
-@app.route('/fridge/delete/<int:item_id>', methods=['POST'])
+
+@app.delete("/fridge/<int:item_id>")
 @jwt_required()
 def delete_fridge_item(item_id):
-    user_id = get_jwt_identity()
-    item = FridgeItem.query.filter_by(id=item_id, user_id=int(user_id)).first()
+    item = FridgeItem.query.filter_by(id=item_id, user_id=current_user_id()).first()
     if not item:
-        return jsonify({"error": "Item not found or not yours"}), 404
-
+        return error("Item not found.", 404)
     db.session.delete(item)
     db.session.commit()
-    return jsonify({"message": "Item deleted successfully!"}), 200
+    return jsonify({"message": "Removed."})
 
-@app.route('/list_tables')
+
+# ---------- shopping list ----------
+
+@app.get("/shopping")
 @jwt_required()
-def list_tables():
-    tables = db.engine.table_names()
-    return {"tables": tables}
+def get_shopping():
+    items = (ShoppingItem.query.filter_by(user_id=current_user_id())
+             .order_by(ShoppingItem.checked, ShoppingItem.created_at.desc())
+             .all())
+    return jsonify([shopping_dict(i) for i in items])
 
 
-
-@app.route('/youtube_tutorial', methods=['GET'])
+@app.post("/shopping")
 @jwt_required()
-def youtube_tutorial():
-    query = request.args.get('query', '').strip()
-    if not query:
-        return jsonify({"error": "Query parameter is required."}), 400
+def add_shopping():
+    text = clean_str(body().get("text"), 200)
+    if not text:
+        return error("Type something to add.", 400)
+    item = ShoppingItem(user_id=current_user_id(), text=text, term=catalog.clean_term(text)[:100])
+    db.session.add(item)
+    db.session.commit()
+    return jsonify(shopping_dict(item)), 201
 
-    YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')  
-    if not YOUTUBE_API_KEY:
-        return jsonify({"error": "YouTube API key not configured."}), 500
 
-    youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
-    request_youtube = youtube.search().list(
-        part="snippet",
-        q=f"{query} tutorial",
-        type="video",
-        maxResults=1
-    )
-    response = request_youtube.execute()
+@app.patch("/shopping/<int:item_id>")
+@jwt_required()
+def update_shopping(item_id):
+    item = ShoppingItem.query.filter_by(id=item_id, user_id=current_user_id()).first()
+    if not item:
+        return error("Item not found.", 404)
+    checked = body().get("checked")
+    if isinstance(checked, bool):
+        item.checked = checked
+    db.session.commit()
+    return jsonify(shopping_dict(item))
 
-    if 'items' in response and len(response['items']) > 0:
-        video_id = response['items'][0]['id']['videoId']
-        youtube_url = f"https://www.youtube.com/embed/{video_id}"
-        return jsonify({"youtube_url": youtube_url}), 200
-    else:
-        return jsonify({"youtube_url": ""}), 200
+
+@app.delete("/shopping/checked")
+@jwt_required()
+def clear_checked_shopping():
+    removed = ShoppingItem.query.filter_by(user_id=current_user_id(), checked=True).delete()
+    db.session.commit()
+    return jsonify({"removed": removed})
+
+
+@app.delete("/shopping/<int:item_id>")
+@jwt_required()
+def delete_shopping(item_id):
+    item = ShoppingItem.query.filter_by(id=item_id, user_id=current_user_id()).first()
+    if not item:
+        return error("Item not found.", 404)
+    db.session.delete(item)
+    db.session.commit()
+    return jsonify({"message": "Removed."})
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=8080)
